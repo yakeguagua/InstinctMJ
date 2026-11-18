@@ -43,3 +43,6 @@ diag_fix_test.py
 check_ref*.py
 webplay_hoi.py
 *.slurm
+
+# Cloud submission scripts contain credentials (.bd_env) and local paths; keep them local-only
+/cloud/

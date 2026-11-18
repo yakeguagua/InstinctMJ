@@ -67,7 +67,10 @@ __file_dir__ = os.path.dirname(os.path.realpath(__file__))
 # Keep `filtered_motion_selection_filepath` under this directory unless you point it elsewhere.
 # Example:
 # _PARKOUR_DATASET_DIR = os.path.expanduser("~/your/path/to/parkour_motion_reference")
-_PARKOUR_DATASET_DIR = os.path.expanduser("~/Xyk/Datasets/data&model/parkour_motion_reference")
+_PARKOUR_DATASET_DIR = os.environ.get(
+    "PARKOUR_DATASET_DIR",
+    os.path.expanduser("~/Xyk/Datasets/data&model/parkour_motion_reference"),
+)
 
 # ---------------------------------------------------------------------------
 # Motion reference configs
@@ -120,7 +123,7 @@ motion_reference_cfg = MotionReferenceManagerCfg(
     update_period=0.02,
     num_frames=10,
     motion_buffers={"run_walk": AmassMotionCfg()},
-    mp_split_method="Even",
+    mp_split_method="None",
 )
 # ---------------------------------------------------------------------------
 # Shoe spec factory
@@ -953,6 +956,14 @@ def instinct_g1_parkour_amp_env_cfg(
             sensor_cfg for sensor_cfg in cfg.scene.sensors if sensor_cfg.name == "leg_volume_points"
         )
         leg_volume_points_sensor.debug_vis = True
+
+        # Render the depth camera's field of view in the viewer: cyan hit points
+        # for the crop window the policy observes, sparse gray points for the
+        # cropped-away region, plus sample rays and the camera pose frame.
+        camera_sensor = next(
+            sensor_cfg for sensor_cfg in cfg.scene.sensors if sensor_cfg.name == "camera"
+        )
+        camera_sensor.debug_vis = True
 
         cfg.scene.terrain.collision_debug_vis = False
         cfg.commands["base_velocity"].debug_vis = True

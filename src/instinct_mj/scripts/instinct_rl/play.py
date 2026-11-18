@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import cv2
 import mjlab
+import numpy as np
 import torch
 import tyro
 from instinct_rl.runners import OnPolicyRunner
@@ -52,13 +54,124 @@ class PlayConfig:
     onnx_model_dir: str | None = None
     no_resume: bool = False
     no_terminations: bool = False
+    depth_view: bool = False
+
+
+class DepthViewWindow:
+    """Live depth-image window showing the selected env's raw and processed depth.
+
+    Displays two panels side by side, updated once per simulation step:
+    - left: raw ``distance_to_image_plane`` (36x64, meters) with the noise-pipeline
+      crop window outlined in red,
+    - right: processed ``distance_to_image_plane_noised`` (18x32, normalized 0-1)
+      rendered with a turbo colormap.
+
+    Keys (with focus on the OpenCV window):
+    - ``1``-``9``/``0``: select environment (defaults to 0),
+    - ``ESC``: close the window (playback continues).
+    """
+
+    _WINDOW_NAME = "Depth View (raw | processed)"
+
+    def __init__(self, scene, num_envs: int):
+        self._camera = scene.sensors["camera"]
+        self._num_envs = max(1, int(num_envs))
+        self.env_idx = 0
+        self._active = True
+        cv2.namedWindow(self._WINDOW_NAME, cv2.WINDOW_NORMAL)
+
+    def close(self) -> None:
+        if self._active:
+            cv2.destroyWindow(self._WINDOW_NAME)
+            self._active = False
+
+    def update(self) -> None:
+        if not self._active:
+            return
+        if cv2.getWindowProperty(self._WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            self._active = False
+            return
+
+        output = self._camera.data.output
+        raw = output.get("distance_to_image_plane")
+        processed = output.get("distance_to_image_plane_noised")
+        if raw is None or processed is None:
+            return
+
+        raw_img = raw[self.env_idx, :, :, 0].float().cpu().numpy()  # (36, 64) meters
+        processed_img = processed[self.env_idx, :, :, 0].float().cpu().numpy()  # (18, 32) [0, 1]
+
+        panel = self._compose_panels(raw_img, processed_img)
+        cv2.imshow(self._WINDOW_NAME, panel)
+
+        key = cv2.waitKey(1) & 0xFF
+        if ord("1") <= key <= ord("9"):
+            self.env_idx = key - ord("1")
+        elif key == ord("0"):
+            self.env_idx = self._num_envs - 1
+        elif key == 27:  # ESC
+            self.close()
+
+    def _compose_panels(self, raw_img: np.ndarray, processed_img: np.ndarray) -> np.ndarray:
+        raw_h, raw_w = raw_img.shape
+        # Raw depth in meters, clipped to the sensor range for stable contrast.
+        raw_scaled = np.clip(np.nan_to_num(raw_img, nan=2.5), 0.0, 2.5) / 2.5
+        raw_panel = (255.0 * (1.0 - raw_scaled)).astype(np.uint8)
+        raw_panel = cv2.cvtColor(raw_panel, cv2.COLOR_GRAY2BGR)
+
+        # Outline the noise-pipeline crop window on the raw panel.
+        top, bottom, left, right = self._crop_region(raw_h, raw_w)
+        crop_rect = [left, top, raw_w - left - right, raw_h - top - bottom]
+        if crop_rect[2] > 0 and crop_rect[3] > 0:
+            cv2.rectangle(raw_panel, crop_rect, (0, 0, 255), 1)
+
+        # Processed panel: normalized depth rendered with a turbo colormap.
+        processed_scaled = (255.0 * np.clip(np.nan_to_num(processed_img), 0.0, 1.0)).astype(np.uint8)
+        processed_panel = cv2.applyColorMap(processed_scaled, cv2.COLORMAP_TURBO)
+
+        # Match panel heights for side-by-side display.
+        scale = 5
+        raw_panel = cv2.resize(
+            raw_panel, (raw_w * scale, raw_h * scale), interpolation=cv2.INTER_NEAREST
+        )
+        target_h = raw_panel.shape[0]
+        processed_panel = cv2.resize(
+            processed_panel,
+            (processed_panel.shape[1] * target_h // processed_panel.shape[0], target_h),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+        panel = np.concatenate(
+            [raw_panel, np.full((target_h, 8, 3), 40, np.uint8), processed_panel], axis=1
+        )
+        cv2.putText(
+            panel,
+            f"env {self.env_idx + 1}/{self._num_envs} | 1-9/0: switch env | ESC: close",
+            (6, target_h - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        return panel
+
+    def _crop_region(self, height: int, width: int) -> tuple[int, int, int, int]:
+        noise_pipeline = getattr(self._camera.cfg, "noise_pipeline", None)
+        if isinstance(noise_pipeline, dict):
+            crop_cfg = noise_pipeline.get("crop_and_resize")
+            crop_region = getattr(crop_cfg, "crop_region", None)
+            if crop_region is not None:
+                return tuple(int(v) for v in crop_region)
+        return 0, 0, 0, 0
 
 
 class _ViewerEnvAdapter:
     """Adapter so mjlab viewers can consume instinct_rl vec envs."""
 
-    def __init__(self, vec_env: InstinctRlVecEnvWrapper):
+    def __init__(self, vec_env: InstinctRlVecEnvWrapper, depth_view: DepthViewWindow | None = None):
         self._vec_env = vec_env
+        self._depth_view = depth_view
         self.num_envs = vec_env.num_envs
 
     @property
@@ -75,6 +188,8 @@ class _ViewerEnvAdapter:
 
     def get_observations(self):
         obs, _ = self._vec_env.get_observations()
+        if self._depth_view is not None:
+            self._depth_view.update()
         return obs
 
     def step(self, actions):
@@ -361,6 +476,74 @@ def _export_policy_to_onnx(
     print(f"[INFO] Exported ONNX artifacts to: {export_dir}")
 
 
+def _patch_native_debug_visualizer_geom_guard() -> None:
+    """Guard native debug-visualizer geometry calls against scene maxgeom overflow.
+
+    ``MjvScene.geoms`` is a fixed-size array; adding beyond ``maxgeom`` writes out of
+    bounds. This is only reachable when rendering debug elements for many envs at
+    once (show-all-envs mode), so guard the add-geometry methods defensively.
+    """
+    from mjlab.viewer.native.visualizer import MujocoNativeDebugVisualizer
+
+    for method_name in ("add_sphere", "add_arrow", "add_cylinder", "add_ellipsoid", "add_box"):
+        method = getattr(MujocoNativeDebugVisualizer, method_name, None)
+        if method is None or getattr(method, "_geom_guarded", False):
+            continue
+        original = method
+
+        def guarded(self, *args, _original=original, **kwargs):
+            if self._mjv_scene.ngeom >= self._mjv_scene.maxgeom:
+                return
+            return _original(self, *args, **kwargs)
+
+        guarded.__name__ = original.__name__
+        guarded.__doc__ = original.__doc__
+        guarded._geom_guarded = True
+        setattr(MujocoNativeDebugVisualizer, method_name, guarded)
+
+
+def _make_track_camera_key_callback(viewer_env, viewer_holder: dict):
+    """Key callback toggling the native viewer camera between world and tracking modes.
+
+    Pressing ``T`` switches the camera between the free world view and tracking the
+    selected environment's robot (``mjCAMERA_TRACKING`` on the robot root body).
+    Combined with ``,``/``.`` (switch selected env), this gives a quick way to
+    inspect any of the parallel robots up close.
+    """
+    import mujoco
+    from mjlab.viewer.native.keys import KEY_T
+
+    root_body_id = viewer_env.unwrapped.scene["robot"].indexing.root_body_id
+
+    def on_key(key: int) -> None:
+        viewer = viewer_holder.get("viewer")
+        if viewer is None or key != KEY_T:
+            return
+        handle = viewer.viewer
+        if handle is None:
+            return
+        cam = handle.cam
+        if cam.type == mujoco.mjtCamera.mjCAMERA_TRACKING.value:
+            cam.type = mujoco.mjtCamera.mjCAMERA_FREE.value
+            cam.trackbodyid = -1
+            cam.fixedcamid = -1
+            cam.lookat[:] = viewer.cfg.lookat
+            cam.distance = viewer.cfg.distance
+            cam.elevation = viewer.cfg.elevation
+            cam.azimuth = viewer.cfg.azimuth
+            print("[INFO] Camera: world free view")
+        else:
+            cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING.value
+            cam.trackbodyid = root_body_id
+            cam.fixedcamid = -1
+            cam.distance = 2.0
+            cam.elevation = -20.0
+            cam.azimuth = 90.0
+            print(f"[INFO] Camera: tracking robot of env {viewer.env_idx + 1}")
+
+    return on_key
+
+
 def _run_headless_rollout(
     env: _ViewerEnvAdapter,
     policy,
@@ -456,7 +639,15 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
         critic_group=agent_cfg.critic_observation_group,
     )
 
-    viewer_env = _ViewerEnvAdapter(vec_env)
+    depth_view = None
+    if cfg.depth_view:
+        if not has_display:
+            print("[WARN] --depth-view requires a display; skipping depth window.")
+        else:
+            depth_view = DepthViewWindow(vec_env.unwrapped.scene, vec_env.num_envs)
+            print("[INFO] Depth view window opened (1-9/0: switch env, ESC: close).")
+
+    viewer_env = _ViewerEnvAdapter(vec_env, depth_view=depth_view)
 
     if cfg.agent in {"zero", "random"}:
         policy = _build_dummy_policy(cfg.agent, (vec_env.num_envs, vec_env.num_actions), device)
@@ -516,9 +707,18 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
     rollout_steps = _resolve_rollout_steps(cfg)
 
     if viewer_backend == "native":
-        viewer = NativeMujocoViewer(viewer_env, policy)
+        _patch_native_debug_visualizer_geom_guard()
+        viewer_holder: dict = {}
+        key_callback = _make_track_camera_key_callback(viewer_env, viewer_holder)
+        viewer = NativeMujocoViewer(viewer_env, policy, key_callback=key_callback)
+        viewer_holder["viewer"] = viewer
         _patch_world_free_camera(viewer)
         _force_viewer_realtime_1x(viewer)
+        if vec_env.num_envs > 1:
+            # Render sensor debug visuals (e.g. depth-camera field of view) for all
+            # environments by default; press 'A' in the viewer to toggle.
+            viewer._show_all_envs = True
+            print("[INFO] Showing debug visuals for all envs (press 'A' in the viewer to toggle).")
         viewer.run(num_steps=rollout_steps)
     elif viewer_backend == "viser":
         viewer = ViserPlayViewer(viewer_env, policy)
@@ -549,12 +749,33 @@ def main() -> None:
 
     args = tyro.cli(
         PlayConfig,
-        args=remaining_args,
+        args=_allow_bare_boolean_flags(remaining_args),
         default=PlayConfig(),
         prog=sys.argv[0] + f" {chosen_task}",
         config=mjlab.TYRO_FLAGS,
     )
     run_play(chosen_task, args)
+
+
+def _allow_bare_boolean_flags(argv: list[str]) -> list[str]:
+    """Expand bare boolean flags into ``--flag True`` form.
+
+    ``mjlab.TYRO_FLAGS`` enables ``tyro.conf.FlagConversionOff``, so boolean
+    options normally require an explicit value (``--depth-view True``). For
+    user-facing convenience, accept the bare flag form as well: a ``--depth-view``
+    not followed by a value is expanded to ``--depth-view True``, while an
+    explicit ``--depth-view True/False`` is passed through untouched.
+    """
+    bare_flags = ("--depth-view", "--depth_view")
+    expanded: list[str] = []
+    for i, arg in enumerate(argv):
+        expanded.append(arg)
+        if arg not in bare_flags:
+            continue
+        next_is_value = i + 1 < len(argv) and not argv[i + 1].startswith("-")
+        if not next_is_value:
+            expanded.append("True")
+    return expanded
 
 
 if __name__ == "__main__":

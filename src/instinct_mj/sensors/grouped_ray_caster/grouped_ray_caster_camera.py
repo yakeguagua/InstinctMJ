@@ -429,6 +429,15 @@ class GroupedRayCasterCamera(GroupedRayCaster):
     def debug_vis(self, visualizer: DebugVisualizer) -> None:
         """Debug visualization for the grouped ray-caster camera.
 
+        Renders the depth camera's field of view in the viewer:
+        - hit points of rays the policy actually observes (i.e. inside the noise
+          pipeline's crop window) are drawn in cyan,
+        - hit points cropped away by the noise pipeline are drawn sparsely in
+          dark gray so the crop window stands out,
+        - a few sample rays inside the crop window are drawn as arrows to
+          visualize the frustum shape,
+        - the camera pose is drawn as a coordinate frame.
+
         Uses mjlab DebugVisualizer native API.
         """
         if not self.cfg.debug_vis:
@@ -449,26 +458,77 @@ class GroupedRayCasterCamera(GroupedRayCaster):
         # all miss points inside the robot head and make them invisible.
         hit_mask = (raycast_data.distances[env_ids] >= 0).reshape(-1)  # (len(env_ids)*num_rays,)
         viz_points = raycast_data.hit_pos_w[env_ids].reshape(-1, 3)
-        viz_points = viz_points[hit_mask]
+        keep_mask = self._debug_crop_keep_mask(len(env_ids)).reshape(-1)
 
-        max_points = 512
-        if viz_points.shape[0] > max_points:
-            stride = max(1, viz_points.shape[0] // max_points)
-            viz_points = viz_points[::stride]
-        viz_points_np = viz_points.cpu().numpy()
+        # When visualizing all environments, use a much smaller per-env budget so
+        # the total number of viewer geoms stays bounded.
+        if getattr(visualizer, "show_all_envs", False):
+            max_points = 96
+            max_dropped_points = 12
+            num_arrows_per_env = 6
+        else:
+            max_points = 512
+            max_dropped_points = 64
+            num_arrows_per_env = 24
 
-        for point in viz_points_np:
+        # -- rays inside the crop window: what the policy actually observes --
+        kept_points = viz_points[hit_mask & keep_mask]
+        if kept_points.shape[0] > max_points:
+            stride = max(1, kept_points.shape[0] // max_points)
+            kept_points = kept_points[::stride]
+        kept_points_np = kept_points.cpu().numpy()
+
+        for point in kept_points_np:
             visualizer.add_sphere(
                 center=point,
                 radius=point_radius,
-                color=(1.0, 0.1, 0.1, 0.6),
+                color=(0.05, 0.85, 1.0, 0.65),
             )
 
+        # -- rays cropped away by the noise pipeline: sparse gray hint --
+        dropped_points = viz_points[hit_mask & ~keep_mask]
+        if dropped_points.shape[0] > max_dropped_points:
+            stride = max(1, dropped_points.shape[0] // max_dropped_points)
+            dropped_points = dropped_points[::stride]
+        dropped_points_np = dropped_points.cpu().numpy()
+
+        for point in dropped_points_np:
+            visualizer.add_sphere(
+                center=point,
+                radius=point_radius * 0.7,
+                color=(0.5, 0.5, 0.5, 0.3),
+            )
+
+        # -- sample rays inside the crop window as arrows (frustum shape) --
         camera_pos = self._camera_data.pos_w[env_ids]
         camera_quat = self._camera_data.quat_w_world[env_ids]
         camera_rot = math_utils.matrix_from_quat(camera_quat)
         camera_pos_np = camera_pos.cpu().numpy()
         camera_rot_np = camera_rot.cpu().numpy()
+
+        hit_mask_2d = raycast_data.distances[env_ids] >= 0
+        keep_mask_2d = self._debug_crop_keep_mask(len(env_ids))
+        arrow_width = max(0.004 * meansize, 0.002)
+        for env_pos, env_hit, env_keep, cam_pos in zip(
+            range(len(env_ids)), hit_mask_2d, keep_mask_2d, camera_pos_np, strict=True
+        ):
+            ray_indices = torch.nonzero(env_hit & env_keep)
+            if ray_indices.dim() > 1:
+                ray_indices = ray_indices[:, -1]
+            else:
+                ray_indices = ray_indices.flatten()
+            if ray_indices.numel() == 0:
+                continue
+            stride = max(1, ray_indices.numel() // num_arrows_per_env)
+            for ray_index in ray_indices[::stride]:
+                hit_point = raycast_data.hit_pos_w[env_ids[env_pos], ray_index].cpu().numpy()
+                visualizer.add_arrow(
+                    start=cam_pos,
+                    end=hit_point,
+                    color=(0.2, 0.9, 0.9, 0.45),
+                    width=arrow_width,
+                )
+
         for idx in range(len(env_ids)):
             visualizer.add_frame(
                 position=camera_pos_np[idx],
@@ -481,6 +541,29 @@ class GroupedRayCasterCamera(GroupedRayCaster):
     """
     Private Helpers
     """
+
+    def _debug_crop_keep_mask(self, num_envs: int) -> torch.Tensor:
+        """Boolean mask (num_envs, num_rays) marking rays inside the noise-pipeline crop window.
+
+        Rays are laid out row-major over the pattern image (ray index = v * width + u).
+        A crop region of (top, bottom, left, right) keeps rows [top, height - bottom)
+        and columns [left, width - right); when no crop-and-resize noise stage is
+        configured, all rays are kept.
+        """
+        pattern = self.cfg.pattern
+        width, height = int(pattern.width), int(pattern.height)
+        top = bottom = left = right = 0
+        noise_pipeline = getattr(self.cfg, "noise_pipeline", None)
+        if isinstance(noise_pipeline, dict):
+            crop_cfg = noise_pipeline.get("crop_and_resize")
+            crop_region = getattr(crop_cfg, "crop_region", None)
+            if crop_region is not None:
+                top, bottom, left, right = (int(value) for value in crop_region)
+        ray_indices = torch.arange(width * height)
+        u = ray_indices % width
+        v = ray_indices // width
+        keep = (u >= left) & (u < width - right) & (v >= top) & (v < height - bottom)
+        return keep.unsqueeze(0).expand(num_envs, -1).to(self.raycast_data.distances.device)
 
     def _check_supported_data_types(self, cfg: GroupedRayCasterCameraCfg):
         """Checks if the data types are supported by the grouped-ray-caster camera."""

@@ -86,8 +86,8 @@ class G1ParkourPPORunnerCfg(InstinctRlOnPolicyRunnerCfg):
     num_steps_per_env: int = 24
     policy_observation_group: str = "policy"
     critic_observation_group: str = "critic"
-    max_iterations: int = 30000
-    save_interval: int = 5000
+    max_iterations: int = 80000
+    save_interval: int = 2000
     experiment_name: str = "g1_parkour"
     resume: bool = False
     load_run: str = "^(?!_play$).*"

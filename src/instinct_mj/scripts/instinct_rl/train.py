@@ -98,7 +98,9 @@ def _resolve_distributed_runtime(
     is_distributed = world_size > 1
     if is_distributed:
         device = f"cuda:{local_rank}"
-        seed = cfg.agent.seed + local_rank
+        # 用全局 rank 做种子偏移，保证多机多卡下各 rank 种子互不相同
+        # （local_rank 在每台节点上都会从 0 开始，跨节点会重复）。
+        seed = cfg.agent.seed + rank
     else:
         if cfg.gpu_ids is not None and os.environ.get("CUDA_VISIBLE_DEVICES", "") != "":
             device = "cuda:0"
@@ -304,13 +306,20 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
 def launch_training(task_id: str, args: TrainConfig | None = None) -> None:
     args = args or TrainConfig.from_task(task_id)
-    log_root_path = Path("logs") / "instinct_rl" / args.agent.experiment_name
+    log_root_path = Path(os.environ.get("LOG_ROOT", "logs")) / "instinct_rl" / args.agent.experiment_name
     log_dir_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if args.env.run_name:
         log_dir_name += f"_{args.env.run_name}"
     if args.agent.run_name:
         log_dir_name += f"_{args.agent.run_name}"
     log_dir = log_root_path / log_dir_name
+
+    # 已经处于 torchrun / 多机分布式启动环境时（RANK/LOCAL_RANK 由启动器注入），
+    # 直接运行本进程的训练函数，不要再套一层 torchrunx / select_gpus。
+    # 否则每个 torchrun 子进程又会各自拉起 8 个 worker，导致进程数爆炸。
+    if os.environ.get("RANK") is not None or os.environ.get("LOCAL_RANK") is not None:
+        run_train(task_id=task_id, cfg=args, log_dir=log_dir)
+        return
 
     if args.gpu_ids is None:
         run_train(task_id=task_id, cfg=args, log_dir=log_dir)
